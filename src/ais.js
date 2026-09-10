@@ -54,9 +54,9 @@ class AISClient {
   async login() {
     await this.ensureReady();
 
-    if (!this.hasUsableAISPage()) {
+    if (!await this.hasUsableAISPage()) {
       this.log('Opening AIS');
-      await this.page.goto(this.config.appointmentUrl || this.config.loginUrl, { waitUntil: 'domcontentloaded' });
+      await this.page.goto(this.config.loginUrl, { waitUntil: 'domcontentloaded' });
       await this.pauseAfterInteraction();
     }
 
@@ -74,28 +74,91 @@ class AISClient {
     this.log('Filling AIS login form');
     await this.fillLoginForm();
 
-    if (this.isManualLoginSubmitEnabled()) {
+    if (!this.isAutomaticLoginSubmitEnabled()) {
       this.log('Waiting for manual checkbox and login submit');
       await this.waitForLoginCompletion(this.config.manualLoginTimeoutMs || 180000);
       this.log('Login completed');
       return;
     }
 
-    this.log('Submitting AIS login form');
-    await this.clickLoginSubmit(
-      /sign in|iniciar sesión|ingresar/i,
-      this.config.selectors && this.config.selectors.signInButton
-    );
-    await this.pauseAfterInteraction();
+    await this.completeAutomaticLogin();
+  }
 
-    await this.page.waitForLoadState('domcontentloaded');
+  async completeAutomaticLogin() {
+    const maxAttempts = Math.max(1, Number(this.config.loginSubmitAttempts || 2));
 
-    if (await this.isSecurityChallengeVisible()) {
-      await this.waitForHumanIntervention('Complete the security check in the browser, then press Enter here.');
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      this.log(attempt === 1
+        ? 'Accepting AIS policy checkbox automatically'
+        : `AIS is still on the login form; retrying login (${attempt}/${maxAttempts})`
+      );
+      await this.acceptLoginPolicy();
+
+      const loginResponseTimeoutMs = Number(this.config.loginSubmitResponseTimeoutMs || 10000);
+      const loginSubmittedAt = Date.now();
+      this.log('Submitting AIS login form');
+      await this.clickLoginSubmit(
+        /sign in|iniciar sesión|ingresar/i,
+        this.config.selectors && this.config.selectors.signInButton
+      );
+      await this.pauseAfterInteraction();
+
+      if (await this.dismissLoginInfoPopup()) {
+        if (attempt < maxAttempts) {
+          const retryDelayMs = Number(this.config.loginPopupRetryDelayMs || 2000);
+          this.log(`AIS requested login confirmation; waiting ${retryDelayMs}ms before retrying`);
+          await this.page.waitForTimeout(retryDelayMs);
+          this.log('Filling AIS login form again');
+          await this.fillLoginForm();
+          continue;
+        }
+      }
+
+      if (await this.isSecurityChallengeVisible()) {
+        await this.waitForHumanIntervention('Complete the security check in the browser, then press Enter here.');
+        await this.waitForLoginCompletion();
+        this.log('Login completed');
+        return;
+      }
+
+      const remainingAfterSubmitMs = Math.max(0, loginResponseTimeoutMs - (Date.now() - loginSubmittedAt));
+      const completed = await this.waitForLoginPageExit(remainingAfterSubmitMs);
+      if (completed) {
+        const remainingAfterPageChangeMs = Math.max(0, loginResponseTimeoutMs - (Date.now() - loginSubmittedAt));
+        await this.waitForPostLoginPageReady(remainingAfterPageChangeMs);
+        this.log('Login completed');
+        return;
+      }
+
+      if (attempt < maxAttempts) {
+        // Refill the form in case AIS cleared its fields after the failed submit.
+        this.log('Filling AIS login form again');
+        await this.fillLoginForm();
+      }
     }
 
-    await this.waitForLoginCompletion();
-    this.log('Login completed');
+    const loginError = await this.readLoginErrorText();
+    const suffix = loginError ? ` AIS message: ${loginError}` : '';
+    throw new Error(`AIS login did not complete after ${maxAttempts} attempt(s). Current URL: ${this.page.url()}.${suffix}`);
+  }
+
+  async dismissLoginInfoPopup() {
+    const dialog = this.page.locator('div.ui-dialog:has(#flash_messages)').first();
+    const message = await dialog.innerText({ timeout: 3000 }).catch(() => '');
+
+    if (!/you need to sign in or sign up before continuing|debe iniciar sesión|necesita iniciar sesión/i.test(message)) {
+      return false;
+    }
+
+    const acceptButton = dialog.locator('button:has-text("OK")').first();
+    if (!await acceptButton.isVisible().catch(() => false)) {
+      return false;
+    }
+
+    this.log('Accepting AIS login confirmation popup');
+    await acceptButton.click();
+    await dialog.waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
+    return true;
   }
 
   async clickLoginSubmit(namePattern, selector) {
@@ -138,30 +201,50 @@ class AISClient {
     }
     await this.pauseAfterInteraction();
 
-    if (!this.isManualLoginSubmitEnabled()) {
-      const checkbox = this.page.locator(selectors.policyCheckbox || 'input[type="checkbox"]').first();
-      if (await checkbox.count()) {
-        await checkbox.check({ force: true });
-        await this.pauseAfterInteraction();
-      }
+  }
+
+  async acceptLoginPolicy() {
+    const selectors = this.config.selectors || {};
+    const checkboxSelector = selectors.policyCheckbox || 'input[type="checkbox"]';
+    const checkbox = this.page.locator(checkboxSelector).first();
+
+    if (!await checkbox.count()) {
+      throw new Error(`AIS policy checkbox was not found: ${checkboxSelector}`);
     }
+
+    await checkbox.check({ force: true });
+
+    if (!await checkbox.isChecked()) {
+      throw new Error(`AIS policy checkbox could not be selected: ${checkboxSelector}`);
+    }
+
+    await this.pauseAfterInteraction();
   }
 
   async waitForLoginCompletion(timeout = 20000) {
-    const completed = await this.page.waitForFunction(
-      () => !/\/users\/sign_in/.test(window.location.pathname),
-      null,
-      { timeout }
-    ).then(() => true).catch(() => false);
+    const completed = await this.waitForLoginPageExit(timeout);
 
-    if (completed) return;
+    if (completed) {
+      // AIS changes the URL before the dashboard has finished rendering. Let the
+      // page settle so the next action does not use a partially loaded dashboard.
+      await this.waitForPostLoginPageReady();
+      return;
+    }
 
     const loginError = await this.readLoginErrorText();
     const suffix = loginError ? ` AIS message: ${loginError}` : '';
     throw new Error(`AIS login did not complete. Current URL: ${this.page.url()}.${suffix}`);
   }
 
-  isManualLoginSubmitEnabled() {
+  async waitForLoginPageExit(timeout) {
+    return this.page.waitForFunction(
+      () => !/\/users\/sign_in/.test(window.location.pathname),
+      null,
+      { timeout }
+    ).then(() => true).catch(() => false);
+  }
+
+  isAutomaticLoginSubmitEnabled() {
     return this.config.manualLoginSubmit === true;
   }
 
@@ -222,6 +305,18 @@ class AISClient {
       .filter(Boolean);
   }
 
+  async refreshAppointmentPageBeforeScan() {
+    if (this.config.refreshAppointmentPageBeforeScan === false) return;
+
+    await this.ensureReady();
+    if (!this.isAppointmentPage()) return;
+
+    this.log('Reloading AIS appointment page before the availability scan');
+    await this.page.reload({ waitUntil: 'domcontentloaded' });
+    await this.pauseAfterInteraction();
+    await this.waitForAvailabilityReady();
+  }
+
   async reschedule(target, options = {}) {
     if (options.authorizedByTelegram !== true) {
       throw new Error('Reschedule blocked because Telegram authorization was not provided.');
@@ -278,26 +373,18 @@ class AISClient {
     if (this.isAppointmentPage()) {
       openedAppointmentUrlDirectly = true;
     } else if (this.isGroupsPage() && selectors.dashboardContinue) {
-      this.log('AIS opened the group page, clicking Continue');
-      await this.page.locator(selectors.dashboardContinue).click();
-      await this.pauseAfterInteraction();
-      await this.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+      await this.clickDashboardContinue(selectors.dashboardContinue);
     } else if (this.config.appointmentUrl) {
       await this.page.goto(this.config.appointmentUrl, { waitUntil: 'domcontentloaded' });
       await this.pauseAfterInteraction();
       openedAppointmentUrlDirectly = true;
 
       if (this.isGroupsPage() && selectors.dashboardContinue) {
-        this.log('AIS opened the group page, clicking Continue');
-        await this.page.locator(selectors.dashboardContinue).click();
-        await this.pauseAfterInteraction();
-        await this.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+        await this.clickDashboardContinue(selectors.dashboardContinue);
         openedAppointmentUrlDirectly = false;
       }
     } else if (selectors.dashboardContinue) {
-      await this.page.locator(selectors.dashboardContinue).click();
-      await this.pauseAfterInteraction();
-      await this.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+      await this.clickDashboardContinue(selectors.dashboardContinue);
     } else {
       throw new AISInspectionRequiredError(
         'Missing AIS appointmentUrl or selectors.dashboardContinue. Inspect the logged-in AIS flow and configure the real selector or URL.'
@@ -309,15 +396,14 @@ class AISClient {
       const buttonIsVisible = await rescheduleButton.isVisible({ timeout: 1000 }).catch(() => false);
 
       if (!buttonIsVisible) {
-        await this.page.locator(selectors.rescheduleOpenAction).first().click();
+        await this.clickWithoutNavigationWait(this.page.locator(selectors.rescheduleOpenAction).first());
         await this.pauseAfterInteraction();
       }
     }
 
     if (!openedAppointmentUrlDirectly && selectors.rescheduleAction) {
-      await this.page.locator(selectors.rescheduleAction).click();
+      await this.clickWithoutNavigationWait(this.page.locator(selectors.rescheduleAction).first());
       await this.pauseAfterInteraction();
-      await this.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
     }
 
     if (await this.isSecurityChallengeVisible()) {
@@ -328,6 +414,57 @@ class AISClient {
     this.log(`AIS appointment page ready in ${Date.now() - startedAt}ms`);
   }
 
+  async clickDashboardContinue(selector) {
+    const continueButton = await this.firstVisibleDashboardContinue(selector);
+    const afterClickWait = Number(this.config.dashboardContinueAfterClickWaitMs ?? 5000);
+    this.log('AIS dashboard is ready, clicking the first visible Continue button');
+    await continueButton.scrollIntoViewIfNeeded().catch(() => {});
+    await continueButton.evaluate((element) => element.click());
+    if (afterClickWait > 0) {
+      await this.page.waitForTimeout(afterClickWait);
+    }
+  }
+
+  async waitForPostLoginPageReady(timeoutMs = 10000) {
+    let remainingMs = Math.max(0, Number(timeoutMs));
+    if (!remainingMs) return;
+
+    const startedAt = Date.now();
+    await this.page.waitForLoadState('domcontentloaded', { timeout: remainingMs }).catch(() => {});
+    remainingMs -= Date.now() - startedAt;
+    if (remainingMs <= 0) return;
+
+    await this.page.waitForLoadState('networkidle', { timeout: remainingMs }).catch(() => {
+      this.log('AIS still has background requests; continuing after the dashboard load timeout');
+    });
+  }
+
+  async firstVisibleDashboardContinue(selector) {
+    const buttons = this.page.locator(selector);
+    const timeout = Number(this.config.dashboardReadyTimeoutMs || 15000);
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+      const count = await buttons.count();
+
+      for (let index = 0; index < count; index += 1) {
+        const button = buttons.nth(index);
+        if (await button.isVisible().catch(() => false)) {
+          return button;
+        }
+      }
+
+      await this.page.waitForTimeout(200);
+    }
+
+    throw new Error(`AIS dashboard did not show a visible Continue button within ${timeout}ms: ${selector}`);
+  }
+
+  async clickWithoutNavigationWait(locator) {
+    await locator.waitFor({ state: 'visible', timeout: Number(this.config.dashboardReadyTimeoutMs || 5000) });
+    await locator.evaluate((element) => element.click());
+  }
+
   isGroupsPage() {
     return /\/niv\/groups\/\d+/.test(new URL(this.page.url()).pathname);
   }
@@ -336,12 +473,17 @@ class AISClient {
     return /\/niv\/schedule\/\d+\/appointment/.test(new URL(this.page.url()).pathname);
   }
 
-  hasUsableAISPage() {
+  async hasUsableAISPage() {
     if (!this.page || this.page.isClosed()) return false;
 
     try {
       const url = new URL(this.page.url());
-      return url.hostname === 'ais.usvisa-info.com' && !/\/users\/sign_in/.test(url.pathname);
+      if (url.hostname !== 'ais.usvisa-info.com' || /\/users\/sign_in/.test(url.pathname)) {
+        return false;
+      }
+
+      const pageText = await this.page.locator('body').innerText({ timeout: 500 }).catch(() => '');
+      return !/ERR_CONNECTION_REFUSED|This site can.t be reached/i.test(pageText);
     } catch {
       return false;
     }
@@ -463,6 +605,11 @@ class AISClient {
 
       if (!consularAvailability) return null;
 
+      if (consularAvailability.date >= this.config.currentDate) {
+        this.log(`Stopping consular scan at ${consularAvailability.date}: it is not earlier than the current appointment ${this.config.currentDate}`);
+        return null;
+      }
+
       if (!consularAvailability.times.length) {
         this.log(`Consular date ${consularAvailability.date} has no available times`);
         afterDate = consularAvailability.date;
@@ -473,6 +620,7 @@ class AISClient {
       for (const timeOption of consularAvailability.times) {
         const consularTime = await this.selectTimeOption(consularTimeSelector, timeOption, { scan: true });
         await this.dispatchInputEvents(consularTimeSelector);
+        await this.pauseAfterConsularTimeSelection();
 
         const ascReady = await this.waitForDependentSectionOrNoAvailability('asc', {
           timeout: this.pageScanDependentTimeoutMs(),
@@ -644,6 +792,10 @@ class AISClient {
     const date = await this.selectFirstAvailableDateWithDatepicker(options.afterDate, options);
     await this.dispatchInputEvents(dateSelector);
 
+    if (options.scan && section === 'consulate') {
+      await this.pauseAfterConsularDateSelection();
+    }
+
     const timeReady = await this.isFormFieldReady(section, 'Time', fieldTimeout || 20000);
     if (!timeReady) {
       return { date, times: [] };
@@ -774,8 +926,10 @@ class AISClient {
     const [year, month, day] = date.split('-').map(Number);
     const rootSelector = this.config.selectors.datePicker || '#ui-datepicker-div';
     const nextSelector = this.config.selectors.datePickerNext || '#ui-datepicker-div a.ui-datepicker-next';
+    const maxNextClicks = this.pageScanMaxDatePickerNextClicks();
+    let nextClicks = 0;
 
-    for (let attempt = 0; attempt < 24; attempt += 1) {
+    while (true) {
       const result = await this.page.evaluate(({ root, target }) => {
         const rootElement = document.querySelector(root);
         if (!rootElement || rootElement.offsetParent === null) return 'missing';
@@ -842,19 +996,26 @@ class AISClient {
       const canGoNext = await next.isVisible({ timeout: 1000 }).catch(() => false);
       if (!canGoNext) return false;
 
+      if (nextClicks >= maxNextClicks) {
+        const message = `Date ${date} was not found after ${maxNextClicks} datepicker next click(s).`;
+        this.log(message);
+        throw new Error(message);
+      }
+
       await next.click();
+      nextClicks += 1;
       await this.pauseAfterInteraction();
       await this.page.waitForTimeout(250);
     }
-
-    throw new Error(`Date ${date} was not visible after navigating the datepicker.`);
   }
 
   async selectFirstAvailableDateWithDatepicker(afterDate = null, options = {}) {
     const rootSelector = this.config.selectors.datePicker || '#ui-datepicker-div';
     const nextSelector = this.config.selectors.datePickerNext || '#ui-datepicker-div a.ui-datepicker-next';
+    const maxNextClicks = this.pageScanMaxDatePickerNextClicks();
+    let nextClicks = 0;
 
-    for (let attempt = 0; attempt < 24; attempt += 1) {
+    while (true) {
       const selectedDate = await this.page.evaluate(({ root, after }) => {
         const rootElement = document.querySelector(root);
         if (!rootElement || rootElement.offsetParent === null) return null;
@@ -925,7 +1086,14 @@ class AISClient {
       const canGoNext = await next.isVisible({ timeout: 1000 }).catch(() => false);
       if (!canGoNext) break;
 
+      if (nextClicks >= maxNextClicks) {
+        const message = `No selectable date found after ${maxNextClicks} datepicker next click(s).`;
+        this.log(message);
+        throw new Error(message);
+      }
+
       await next.click();
+      nextClicks += 1;
       await this.pauseAfterInteractionForOptions(options);
       await this.page.waitForTimeout(250);
     }
@@ -1188,6 +1356,16 @@ class AISClient {
     }
   }
 
+  async pauseAfterConsularDateSelection() {
+    const delayMs = Number(this.config.pageScanConsularDateSelectionDelayMs ?? 2000);
+    if (delayMs > 0) await this.page.waitForTimeout(delayMs);
+  }
+
+  async pauseAfterConsularTimeSelection() {
+    const delayMs = Number(this.config.pageScanConsularTimeSelectionDelayMs ?? 2000);
+    if (delayMs > 0) await this.page.waitForTimeout(delayMs);
+  }
+
   async pauseAfterInteractionForOptions(options = {}) {
     if (options.scan) {
       await this.pauseAfterScanInteraction();
@@ -1219,6 +1397,11 @@ class AISClient {
 
   pageScanMaxAscDates() {
     return Number(this.config.pageScanMaxAscDates || 8);
+  }
+
+  pageScanMaxDatePickerNextClicks() {
+    const configured = Number(this.config.pageScanMaxDatePickerNextClicks ?? 6);
+    return Number.isFinite(configured) ? Math.max(0, configured) : 6;
   }
 
   async isLoggedIn() {
@@ -1260,7 +1443,7 @@ class AISClient {
   async clickByRoleOrSelector(namePattern, selector) {
     if (selector) {
       const target = this.page.locator(selector).first();
-      await target.waitFor({ state: 'attached', timeout: 15000 });
+      await target.waitFor({ state: 'attached', timeout: 6000 });
       await target.scrollIntoViewIfNeeded().catch(() => {});
 
       const visible = await target.isVisible({ timeout: 5000 }).catch(() => false);
@@ -1274,7 +1457,7 @@ class AISClient {
         throw new Error(`Configured selector is disabled: ${selector}`);
       }
 
-      await target.click({ timeout: 10000 });
+      await target.evaluate((element) => element.click());
       return;
     }
 
@@ -1282,7 +1465,7 @@ class AISClient {
     if (await button.count()) {
       const target = button.first();
       await target.scrollIntoViewIfNeeded().catch(() => {});
-      await target.click({ timeout: 10000 });
+      await target.evaluate((element) => element.click());
       return;
     }
 

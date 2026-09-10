@@ -5,10 +5,15 @@ class TelegramBot {
     this.offset = 0;
     this.running = false;
     this.onReschedule = null;
+    this.onSkipReschedule = null;
   }
 
   setRescheduleHandler(handler) {
     this.onReschedule = handler;
+  }
+
+  setSkipRescheduleHandler(handler) {
+    this.onSkipReschedule = handler;
   }
 
   async sendAppointmentAlert(appointment, current) {
@@ -44,6 +49,10 @@ class TelegramBot {
             text: '🔄 REAGENDAR',
             callback_data: `reschedule:${appointment.date}:${appointment.time}`,
           },
+          {
+            text: '✋ NO AGENDAR',
+            callback_data: `skip:${appointment.date}:${appointment.time}`,
+          },
         ]],
       },
     });
@@ -74,6 +83,14 @@ class TelegramBot {
     ].join('\n'));
   }
 
+  async sendRescheduleProcessing(appointment) {
+    await this.sendMessage(`⏳ Solicitud de reagendamiento recibida para ${formatDateForMessage(appointment.date)} ${appointment.time}. Procesando el cambio en AIS.`);
+  }
+
+  async sendNoRescheduleConfirmation(appointment) {
+    await this.sendMessage(`✋ Se conserva la cita actual. No se reagendará la opción del ${formatDateForMessage(appointment.date)} ${appointment.time}.`);
+  }
+
   async sendRescheduleError(error) {
     await this.sendMessage([
       '⚠️ ERROR AL REAGENDAR',
@@ -95,6 +112,7 @@ class TelegramBot {
   startPolling() {
     if (this.running) return;
     this.running = true;
+    this.log('Telegram callback polling started');
     this.poll().catch((error) => {
       this.log(`Telegram polling stopped: ${error.message}`);
     });
@@ -129,18 +147,33 @@ class TelegramBot {
     if (!callback) return;
 
     const chatId = callback.message && callback.message.chat && callback.message.chat.id;
+    const action = parseCallbackData(callback.data);
+    this.log(`Telegram callback received: chat=${chatId || 'unknown'}, data=${callback.data || 'empty'}`);
+
     if (String(chatId) !== String(this.config.chatId)) {
+      this.log('Telegram callback ignored: chat is not authorized');
       return;
     }
 
     await this.call('answerCallbackQuery', {
       callback_query_id: callback.id,
+      text: action && action.type === 'reschedule' ? 'Solicitud recibida' : 'Se conserva la cita actual',
     });
+    this.log(`Telegram callback acknowledged: ${action ? action.type : 'unknown action'}`);
 
-    const appointment = parseCallbackData(callback.data);
-    if (!appointment || !this.onReschedule) return;
+    if (!action) {
+      this.log('Telegram callback ignored: invalid data');
+      return;
+    }
 
-    await this.onReschedule(appointment);
+    if (action.type === 'reschedule' && this.onReschedule) {
+      await this.onReschedule(action.appointment);
+      return;
+    }
+
+    if (action.type === 'skip' && this.onSkipReschedule) {
+      await this.onSkipReschedule(action.appointment);
+    }
   }
 
   async call(method, payload) {
@@ -197,9 +230,12 @@ class TelegramBot {
 }
 
 function parseCallbackData(data) {
-  const match = String(data || '').match(/^reschedule:(\d{4}-\d{2}-\d{2}):(\d{2}:\d{2})$/);
+  const match = String(data || '').match(/^(reschedule|skip):(\d{4}-\d{2}-\d{2}):(\d{2}:\d{2})$/);
   if (!match) return null;
-  return { date: match[1], time: match[2] };
+  return {
+    type: match[1],
+    appointment: { date: match[2], time: match[3] },
+  };
 }
 
 function formatDateForMessage(date) {

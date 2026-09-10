@@ -90,6 +90,16 @@ function ensureStateFile() {
 }
 
 function log(message) {
-  const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestamp = formatLocalTimestamp(new Date());
   console.log(`[${timestamp}] ${message}`);
+}
+
+function formatLocalTimestamp(date) {
+  const pad = (value) => String(value).padStart(2, '0');
+  const offsetMinutes = -date.getTimezoneOffset();
+  const offsetSign = offsetMinutes >= 0 ? '+' : '-';
+  const offsetHours = pad(Math.floor(Math.abs(offsetMinutes) / 60));
+  const offsetRemainder = pad(Math.abs(offsetMinutes) % 60);
+
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${String(date.getMilliseconds()).padStart(3, '0')} UTC${offsetSign}${offsetHours}:${offsetRemainder}`;
 }

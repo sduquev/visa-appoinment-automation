@@ -16,6 +16,7 @@ class AppointmentMonitor {
   start() {
     this.running = true;
     this.telegram.setRescheduleHandler((appointment) => this.handleRescheduleRequest(appointment));
+    this.telegram.setSkipRescheduleHandler((appointment) => this.handleSkipRescheduleRequest(appointment));
     this.scheduleNextCheck(0);
   }
 
@@ -33,6 +34,7 @@ class AppointmentMonitor {
 
     this.checking = true;
     try {
+      await this.ais.refreshAppointmentPageBeforeScan();
       const appointments = await this.ais.getAvailableAppointments();
       const current = this.getCurrentAppointment();
       const earliest = findEarliestEarlierAppointment(appointments, current);
@@ -54,6 +56,7 @@ class AppointmentMonitor {
       try {
         await this.telegram.sendAppointmentAlert(earliest, current);
         this.telegram.startPolling();
+        this.log('Waiting for a Telegram decision; callback polling is active');
       } catch (error) {
         this.log(`Telegram notification failed: ${error.message}`);
         return;
@@ -69,28 +72,25 @@ class AppointmentMonitor {
   }
 
   async handleRescheduleRequest(appointment) {
-    this.log('Reschedule requested');
+    this.log(`Reschedule requested from Telegram: ${appointment.date} ${appointment.time}`);
+    await this.telegram.sendRescheduleProcessing(appointment).catch((error) => {
+      this.log(`Telegram processing notification failed: ${error.message}`);
+    });
 
     if (this.checking) {
       this.log('Waiting for active AIS query to finish before rescheduling');
       await waitUntil(() => !this.checking);
     }
 
+    let restartChecks = false;
     this.checking = true;
     try {
-      this.log('Rechecking appointment availability');
-
       const current = this.getCurrentAppointment();
       if (!isEarlier(appointment, current)) {
         throw new Error('Requested appointment is not earlier than the current appointment.');
       }
 
-      const stillAvailable = await this.ais.findExactAvailability(appointment);
-      if (!stillAvailable) {
-        await this.telegram.sendNoLongerAvailable();
-        return;
-      }
-
+      this.log('Submitting the Telegram-selected appointment without another availability check');
       const rescheduledAppointment = await this.ais.reschedule(appointment, { authorizedByTelegram: true });
 
       const state = this.readState();
@@ -103,20 +103,37 @@ class AppointmentMonitor {
       await this.telegram.sendRescheduleSuccess(rescheduledAppointment, current).catch((error) => {
         this.log(`Telegram success notification failed: ${error.message}`);
       });
+      this.log(`Reschedule completed: ${rescheduledAppointment.date} ${rescheduledAppointment.time}`);
     } catch (error) {
       this.log(`Reschedule failed: ${error.message}`);
       await this.telegram.sendRescheduleError(error).catch((telegramError) => {
         this.log(`Telegram failure notification failed: ${telegramError.message}`);
       });
+      restartChecks = true;
     } finally {
       this.checking = false;
     }
+
+    if (restartChecks) {
+      this.log('Restarting appointment checks after reschedule failure');
+      this.scheduleNextCheck(0);
+    }
+  }
+
+  async handleSkipRescheduleRequest(appointment) {
+    this.log(`User chose not to reschedule: ${appointment.date} ${appointment.time}`);
+    await this.telegram.sendNoRescheduleConfirmation(appointment).catch((error) => {
+      this.log(`Telegram no-reschedule notification failed: ${error.message}`);
+    });
   }
 
   scheduleNextCheck(delayMs) {
     if (!this.running) return;
 
+    if (this.timer) clearTimeout(this.timer);
+
     this.timer = setTimeout(async () => {
+      this.timer = null;
       await this.checkOnce();
       this.scheduleNextCheck(this.intervalMs());
     }, delayMs);
